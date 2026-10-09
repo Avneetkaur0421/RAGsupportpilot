@@ -14,8 +14,12 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE TABLE IF NOT EXISTS reviews (
   id TEXT PRIMARY KEY, question TEXT, audience TEXT, topic TEXT, draft TEXT,
   missing TEXT, status TEXT, reply TEXT, created_at REAL, resolved_at REAL);
-CREATE TABLE IF NOT EXISTS added_docs (
-  id TEXT PRIMARY KEY, title TEXT, audience TEXT, markdown TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS sources (
+  doc_id TEXT PRIMARY KEY, title TEXT, audience TEXT, kind TEXT,
+  origin TEXT,        -- folder | upload | url | text | team
+  location TEXT,      -- file path, file name or URL
+  signature TEXT,     -- size + modified time, to spot changed files
+  passages INTEGER, updated_at REAL);
 """
 
 
@@ -79,8 +83,17 @@ def list_logs() -> list[dict]:
     return out
 
 
-def add_doc(title, audience, markdown) -> str:
-    did = new_id()
+def upsert_source(doc_id, title, audience, kind, origin, location, signature, passages):
     with _conn() as con:
-        con.execute("INSERT INTO added_docs VALUES (?,?,?,?,?)", (did, title, audience, markdown, time.time()))
-    return did
+        con.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?,?,?,?,?)",
+                    (doc_id, title, audience, kind, origin, location, signature, passages, time.time()))
+
+
+def list_sources() -> list[dict]:
+    with _conn() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM sources").fetchall()]
+
+
+def delete_source(doc_id):
+    with _conn() as con:
+        con.execute("DELETE FROM sources WHERE doc_id = ?", (doc_id,))

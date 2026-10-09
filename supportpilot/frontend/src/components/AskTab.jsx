@@ -3,21 +3,9 @@ import { api } from "../api.js";
 import { AUDIENCE_LABEL } from "../util.jsx";
 import TracePanel from "./TracePanel.jsx";
 
-const SUGGESTED = {
-  customer: [
-    "How long does a refund take?",
-    "Can I ship a bike to a PO box?",
-    "Is my battery covered if it loses range?",
-    "Can I get a discount for buying 5 bikes for my company?",
-  ],
-  team: [
-    "Can I approve a $450 refund myself?",
-    "A customer says their battery is smoking. What do I do?",
-    "What do I need for a frame warranty claim?",
-  ],
-};
+const HISTORY_TURNS = 3;
 
-export default function AskTab({ reviews, onEscalated }) {
+export default function AskTab({ reviews, onEscalated, suggestions }) {
   const [audience, setAudience] = useState("customer");
   const [thread, setThread] = useState([]); // [{id, question, audience, status, result?, error?}]
   const [activeId, setActiveId] = useState(null);
@@ -38,8 +26,13 @@ export default function AskTab({ reviews, onEscalated }) {
     setActiveId(id);
     setInput("");
     setBusy(true);
+    // Send the last few answered exchanges so follow-ups like "and for accessories?" work.
+    const history = thread
+      .filter((t) => t.audience === audience && t.result && !t.result.skipped_llm)
+      .slice(-HISTORY_TURNS)
+      .map((t) => ({ question: t.question, answer: t.result.answer.replace(/\[P\d+\]/g, "") }));
     try {
-      const result = await api.ask(question, audience);
+      const result = await api.ask(question, audience, history);
       setThread((t) => t.map((x) => (x.id === id ? { ...x, status: result.status, result } : x)));
       if (result.review_id) onEscalated();
     } catch (e) {
@@ -69,13 +62,26 @@ export default function AskTab({ reviews, onEscalated }) {
               </button>
             ))}
           </div>
+          {thread.length > 0 && (
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={busy}
+              onClick={() => {
+                setThread([]);
+                setActiveId(null);
+              }}
+            >
+              New conversation
+            </button>
+          )}
         </div>
 
         <div id="thread" ref={threadRef} aria-live="polite">
           {thread.length === 0 && (
             <p className="empty">
-              Ask a question or pick one below. Switch to <b>Support team</b> to include internal guides such as
-              refund approval limits.
+              Ask a question or pick one below. Follow-up questions work too. Switch to <b>Support team</b> to include
+              internal documents.
             </p>
           )}
           {thread.map((item) => (
@@ -91,7 +97,7 @@ export default function AskTab({ reviews, onEscalated }) {
         </div>
 
         <div className="chips">
-          {SUGGESTED[audience].map((s) => (
+          {(suggestions?.[audience] || []).map((s) => (
             <button key={s} type="button" className="chip" onClick={() => ask(s)}>
               {s}
             </button>

@@ -27,17 +27,17 @@ export default function TracePanel({ item, flash }) {
   const scope = item.audience === "team" ? "including internal guides" : "customer-facing docs only";
   const k = r?.passages.length ?? 0;
 
-  let grade = "Claude is reading the passages and rating how well they answer the question.";
+  let grade = "The model is reading the passages and rating how well they answer the question.";
   if (item.status === "error") grade = "Grading didn't finish.";
   else if (r?.skipped_llm) grade = "No passage was relevant enough, so the question skipped the model and went straight to the team.";
   else if (done)
     grade = {
-      high: "Claude rated the passages as fully answering the question.",
-      medium: "Claude rated the passages as partly answering the question.",
-      low: `Claude found the passages don't answer it.${r.missing ? " Missing: " + r.missing : ""}`,
+      high: "The model rated the passages as fully answering the question.",
+      medium: "The model rated the passages as partly answering the question.",
+      low: `The model found the passages don't answer it.${r.missing ? " Missing: " + r.missing : ""}`,
     }[r.confidence];
 
-  const terms = queryTerms(item.question);
+  const terms = queryTerms(r?.search_query || item.question);
 
   return (
     <aside className="panel trace" aria-label="How this answer was found">
@@ -45,7 +45,14 @@ export default function TracePanel({ item, flash }) {
       <ol className="steps">
         <li className={done ? "on" : ""}>
           <b>Retrieve</b>
-          <span>{done ? `Searched the knowledge base (${scope}) and kept ${k} relevant passage${k === 1 ? "" : "s"}.` : "Searching."}</span>
+          <span>
+            {done
+              ? `Searched the knowledge base (${scope}) and kept ${k} relevant passage${k === 1 ? "" : "s"}.`
+              : "Searching."}
+            {done && r.search_query && r.search_query !== item.question && (
+              <> Treated as a follow-up and searched for: "{r.search_query}"</>
+            )}
+          </span>
         </li>
         <li className={done ? (r.confidence === "low" ? "bad" : "on") : ""}>
           <b>Grade</b>

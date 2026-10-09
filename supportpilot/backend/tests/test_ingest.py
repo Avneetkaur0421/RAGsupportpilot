@@ -7,7 +7,8 @@ import zipfile
 import pytest
 
 from app import config
-from app.ingest import load_file, load_folder, parse_markdown
+from app import ingest
+from app.ingest import load_file, parse_markdown
 
 
 def make_pdf(path, pages):
@@ -16,7 +17,7 @@ def make_pdf(path, pages):
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
     kids = []
     for text in pages:
-        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET" if text else ""
         objs.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
         content_id = len(objs)
         objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
@@ -62,9 +63,8 @@ def test_long_section_is_cut_into_overlapping_pieces(monkeypatch):
     monkeypatch.setattr(config, "CHUNK_OVERLAP", 20)
     long_text = " ".join(f"Sentence number {i} about refunds." for i in range(20))
     chunks = parse_markdown("long", f"# Long\n\n## Refunds\n{long_text}")
-    assert len(chunks) > 1
-    assert all(len(c.text) <= 120 for c in chunks)
-    assert all(c.heading == "Refunds" for c in chunks)  # heading kept on every piece
+    assert len(chunks) > 1 and all(len(c.text) <= 120 for c in chunks)
+    assert all(c.heading == "Refunds" for c in chunks)
 
 
 def test_pdf_becomes_one_passage_per_page(tmp_path):
@@ -72,27 +72,112 @@ def test_pdf_becomes_one_passage_per_page(tmp_path):
     make_pdf(pdf, ["Frames are covered for 5 years.", "Batteries are covered for 2 years."])
     chunks = load_file(pdf)
     assert [c.heading for c in chunks] == ["Page 1", "Page 2"]
-    assert "5 years" in chunks[0].text
-    assert chunks[0].doc_title == "Warranty policy"
+    assert chunks[0].doc_title == "Warranty policy" and chunks[0].kind == "PDF"
+
+
+def test_scanned_pdf_falls_back_to_claude(tmp_path, monkeypatch):
+    pdf = tmp_path / "scan.pdf"
+    make_pdf(pdf, [""])  # a page with no text layer
+    seen = {}
+    def fake_vision(data, media_type):
+        seen["type"] = media_type
+        return "## Opening hours\nOpen 9 to 5."
+    monkeypatch.setattr(ingest, "vision_extract", fake_vision)
+    chunks = load_file(pdf)
+    assert seen["type"] == "application/pdf"
+    assert chunks[0].heading == "Opening hours" and chunks[0].kind == "PDF (scanned)"
+
+
+def test_image_is_read_by_claude(tmp_path, monkeypatch):
+    img = tmp_path / "price-list.png"
+    img.write_bytes(b"\x89PNG fake")
+    monkeypatch.setattr(ingest, "vision_extract", lambda data, mt: "## Prices\nService: $50")
+    chunks = load_file(img)
+    assert chunks[0].text == "Service: $50" and chunks[0].kind == "Image"
+
+
+def test_image_without_vision_gives_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "VISION_EXTRACT", False)
+    img = tmp_path / "x.png"
+    img.write_bytes(b"x")
+    with pytest.raises(ValueError, match="VISION_EXTRACT"):
+        load_file(img)
 
 
 def test_docx_is_loaded(tmp_path):
     docx = tmp_path / "returns.docx"
     make_docx(docx, ["Returns are accepted within 30 days.", "Refunds take 5 to 7 business days."])
     chunks = load_file(docx)
-    assert chunks and "30 days" in chunks[0].text
+    assert chunks and "30 days" in chunks[0].text and chunks[0].kind == "Word"
+
+
+def test_pptx_one_passage_per_slide_with_notes(tmp_path):
+    from pptx import Presentation
+    prs = Presentation()
+    for title, body, note in [("Pricing", "Basic plan is $10.", "Mention the discount."),
+                              ("Support", "Email us any time.", "")]:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = title
+        slide.placeholders[1].text = body
+        if note:
+            slide.notes_slide.notes_text_frame.text = note
+    path = tmp_path / "deck.pptx"
+    prs.save(path)
+    chunks = load_file(path)
+    assert [c.heading for c in chunks] == ["Slide 1: Pricing", "Slide 2: Support"]
+    assert "Notes: Mention the discount." in chunks[0].text
+
+
+def test_excel_rows_keep_column_names(tmp_path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Plans"
+    ws.append(["Plan", "Price", "Users"])
+    ws.append(["Basic", 10, 1])
+    ws.append(["Team", 49, 10])
+    path = tmp_path / "plans.xlsx"
+    wb.save(path)
+    chunks = load_file(path)
+    assert chunks[0].heading == "Plans, rows 2 to 3"
+    assert "Plan: Team; Price: 49; Users: 10" in chunks[0].text
+
+
+def test_large_csv_is_split_into_row_ranges(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CHUNK_SIZE", 200)
+    path = tmp_path / "orders.csv"
+    path.write_text("order,status\n" + "\n".join(f"A{i},shipped" for i in range(1, 41)))
+    chunks = load_file(path)
+    assert len(chunks) > 1 and chunks[0].heading.startswith("Sheet, rows 2 to")
+    assert "order: A1; status: shipped" in chunks[0].text
+
+
+def test_html_strips_tags_and_uses_page_title(tmp_path):
+    path = tmp_path / "page.html"
+    path.write_text("<html><head><title>Store hours</title><script>var x=1</script></head>"
+                    "<body><h1>Hours</h1><p>Open 9 to 5, Monday to Saturday.</p></body></html>")
+    chunks = load_file(path)
+    assert chunks[0].doc_title == "Store hours" and "Open 9 to 5" in chunks[0].text
+    assert "<p>" not in chunks[0].text
+
+
+def test_json_is_flattened(tmp_path):
+    path = tmp_path / "plans.json"
+    path.write_text('{"plans": [{"name": "Basic", "price": 10}]}')
+    text = load_file(path)[0].text
+    assert "plans[0].name: Basic" in text and "plans[0].price: 10" in text
 
 
 def test_internal_folder_sets_audience(tmp_path):
     (tmp_path / "internal").mkdir()
     (tmp_path / "internal" / "limits.txt").write_text("Agents can approve refunds up to $300.")
     (tmp_path / "faq.txt").write_text("We ship to the US and Canada.")
-    by_doc = {c.doc_id: c.audience for c in load_folder(tmp_path)}
-    assert by_doc == {"limits": "internal", "faq": "public"}
+    assert load_file(tmp_path / "internal" / "limits.txt")[0].audience == "internal"
+    assert load_file(tmp_path / "faq.txt")[0].audience == "public"
 
 
 def test_unsupported_file_type_is_rejected(tmp_path):
-    f = tmp_path / "data.xlsx"
+    f = tmp_path / "tool.exe"
     f.write_bytes(b"x")
     with pytest.raises(ValueError):
         load_file(f)

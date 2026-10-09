@@ -1,125 +1,142 @@
-"""Tests that run offline: no API key and no model download needed.
-
-Run from the backend folder:  pytest -q
-"""
-import hashlib
-
+"""Agent, knowledge sync and API tests. Run from the backend folder:  pytest -q"""
 import pytest
-from chromadb import Documents, EmbeddingFunction, Embeddings
+from fastapi.testclient import TestClient
 
-from app import config, vectorstore
-from app.graph import GradedAnswer, build_graph
-from app.ingest import load_folder, parse_markdown
-
-
-class HashEmbedding(EmbeddingFunction[Documents]):
-    """Tiny fake embedding (bag of hashed words) so tests don't download a model."""
-    def __init__(self):
-        pass
-
-    def __call__(self, input: Documents) -> Embeddings:
-        out = []
-        for text in input:
-            v = [0.0] * 64
-            for w in text.lower().split():
-                v[int(hashlib.md5(w.strip(".,?!").encode()).hexdigest(), 16) % 64] += 1.0
-            out.append(v)
-        return out
-
-    @staticmethod
-    def name():
-        return "hash-embedding"
-
-    def get_config(self):
-        return {}
-
-    @staticmethod
-    def build_from_config(config):
-        return HashEmbedding()
+from app import config, knowledge, main, vectorstore
+from app.graph import build_graph
+from tests.conftest import FakeLLM
+from tests.test_ingest import make_pdf
 
 
-class FakeLLM:
-    """Stands in for ChatAnthropic and returns a fixed structured answer."""
-    def __init__(self, confidence):
-        self.confidence = confidence
-
-    def with_structured_output(self, schema):
-        return self
-
-    def invoke(self, prompt):
-        return GradedAnswer(answer="Refunds take 5 to 7 business days [P1].",
-                            confidence=self.confidence, topic="refund timing", missing="")
+@pytest.fixture
+def client(monkeypatch, demo_kb):
+    monkeypatch.setattr(main, "agent", build_graph(FakeLLM("high")))
+    def no_llm():
+        raise RuntimeError("no API key in tests")
+    monkeypatch.setattr(main, "_llm", no_llm)
+    return TestClient(main.app)  # not a context manager, so startup is skipped
 
 
-@pytest.fixture(autouse=True)
-def fresh_store(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "CHROMA_DIR", tmp_path / "chroma")
-    monkeypatch.setattr(vectorstore, "_collection", None)
-    vectorstore.collection(embedding_function=HashEmbedding())
-    vectorstore.upsert(load_folder(config.DOCS_DIR))
-    monkeypatch.setattr(config, "MIN_RELEVANCE", 0.05)
+# ---------- agent ----------
 
-
-def test_parse_markdown_reads_audience_and_sections():
-    chunks = parse_markdown("demo", "---\naudience: internal\n---\n# Demo\n\n## One\nHello.\n\n## Two\nWorld.")
-    assert [c.heading for c in chunks] == ["One", "Two"]
-    assert all(c.audience == "internal" for c in chunks)
-
-
-def test_customers_never_see_internal_guides():
+def test_customers_never_see_internal_guides(demo_kb):
     hits = vectorstore.search("refund approval limits for agents", "customer", 10)
     assert hits and all(h["audience"] == "public" for h in hits)
 
 
-def test_confident_answer_is_returned():
+def test_confident_answer_is_returned(demo_kb):
     out = build_graph(FakeLLM("high")).invoke({"question": "How long does a refund take?", "audience": "customer"})
     assert out["status"] == "answered" and "[P1]" in out["answer"]
 
 
-def test_low_confidence_goes_to_review():
+def test_low_confidence_goes_to_review(demo_kb):
     out = build_graph(FakeLLM("low")).invoke({"question": "Can I get a bulk discount?", "audience": "customer"})
     assert out["status"] == "escalated"
 
 
-def test_api_escalation_creates_review_and_resolving_adds_to_kb(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-    from app import main, store
+def test_follow_up_is_rewritten_before_search(demo_kb):
+    llm = FakeLLM("high")
+    first = build_graph(llm).invoke({"question": "How long does a refund take?", "audience": "customer"})
+    assert llm.plain_calls == 0 and first["search_query"] == "How long does a refund take?"
 
-    monkeypatch.setattr(config, "STORAGE_DIR", tmp_path)
-    monkeypatch.setattr(config, "SQLITE_PATH", tmp_path / "test.db")
-    store.init()
+    follow = build_graph(llm).invoke({"question": "and for accessories?", "audience": "customer",
+                                      "history": [{"question": "How long does a refund take?",
+                                                   "answer": "5 to 7 business days."}]})
+    assert llm.plain_calls == 1 and follow["search_query"] == "How long do refunds take?"
+
+
+# ---------- knowledge sync ----------
+
+def test_folder_sync_adds_updates_and_removes(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    (docs / "internal").mkdir(parents=True)
+    monkeypatch.setattr(config, "DOCS_DIR", docs)
+    faq = docs / "faq.md"
+    faq.write_text("# FAQ\n\n## Shipping\nWe ship to the US.")
+    (docs / "internal" / "limits.txt").write_text("Agents approve refunds up to $300.")
+
+    assert knowledge.sync_folder()["added"] == 2
+    assert knowledge.sync_folder()["unchanged"] == 2           # nothing re-read
+
+    faq.write_text("# FAQ\n\n## Shipping\nWe ship to the US and Canada.")
+    import os, time
+    os.utime(faq, (time.time() + 5, time.time() + 5))         # make sure mtime changes
+    assert knowledge.sync_folder()["updated"] == 1
+
+    (docs / "internal" / "limits.txt").unlink()
+    assert knowledge.sync_folder()["removed"] == 1
+    assert vectorstore.doc_ids() == {"f-faq"}
+
+
+def test_bad_file_in_folder_is_reported_not_fatal(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    monkeypatch.setattr(config, "DOCS_DIR", docs)
+    monkeypatch.setattr(config, "VISION_EXTRACT", False)
+    (docs / "ok.txt").write_text("Fine.")
+    (docs / "photo.png").write_bytes(b"\x89PNG fake")
+    result = knowledge.sync_folder()
+    assert result["added"] == 1 and result["errors"][0]["file"] == "photo.png"
+
+
+def test_only_public_urls_are_allowed():
+    for bad in ["ftp://example.com", "http://localhost:8000", "http://127.0.0.1/admin", "not a url"]:
+        with pytest.raises(ValueError):
+            knowledge.check_public_url(bad)
+
+
+# ---------- API ----------
+
+def test_api_escalation_review_and_team_answer(client, monkeypatch):
     monkeypatch.setattr(main, "agent", build_graph(FakeLLM("low")))
-    client = TestClient(main.app)  # not used as a context manager, so startup is skipped
-
     r = client.post("/api/ask", json={"question": "Can I get a bulk discount?", "audience": "customer"}).json()
     assert r["status"] == "escalated" and r["review_id"]
 
     ok = client.post(f"/api/reviews/{r['review_id']}/resolve",
-                     json={"reply": "Email sales@kestrel.example for orders of 5+ bikes.", "add_to_kb": True})
+                     json={"reply": "Email sales for orders of 5+ bikes.", "add_to_kb": True})
     assert ok.status_code == 200
-    titles = [d["title"] for d in client.get("/api/documents").json()]
-    assert "Support team answers" in titles
+    assert "Team answers" in [d["title"] for d in client.get("/api/documents").json()]
     assert client.get("/api/insights").json()["escalated"] == 1
 
 
-def test_api_upload_pdf(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-    from app import main, store
-    from tests.test_ingest import make_pdf
+def test_api_ask_accepts_history(client):
+    r = client.post("/api/ask", json={"question": "and accessories?", "audience": "customer",
+                                      "history": [{"question": "Refund time?", "answer": "5 to 7 days."}]})
+    assert r.status_code == 200 and r.json()["search_query"] == "How long do refunds take?"
 
-    monkeypatch.setattr(config, "STORAGE_DIR", tmp_path)
-    monkeypatch.setattr(config, "SQLITE_PATH", tmp_path / "test.db")
-    monkeypatch.setattr(config, "UPLOAD_DIR", tmp_path / "uploads")
-    store.init()
-    client = TestClient(main.app)
 
+def test_api_upload_then_delete(client, tmp_path):
     pdf = tmp_path / "holiday.pdf"
     make_pdf(pdf, ["Order by December 18 for delivery before December 25."])
     with pdf.open("rb") as f:
         r = client.post("/api/documents/upload", files={"file": ("holiday.pdf", f, "application/pdf")},
                         data={"title": "Holiday shipping", "audience": "public"})
     assert r.status_code == 200 and r.json()["passages"] == 1
-    assert "Holiday shipping" in [d["title"] for d in client.get("/api/documents").json()]
 
-    bad = client.post("/api/documents/upload", files={"file": ("sheet.xlsx", b"x", "application/octet-stream")})
+    doc = next(d for d in client.get("/api/documents").json() if d["title"] == "Holiday shipping")
+    assert doc["kind"] == "PDF" and doc["deletable"]
+    assert client.delete(f"/api/documents/{doc['doc_id']}").status_code == 200
+    assert "Holiday shipping" not in [d["title"] for d in client.get("/api/documents").json()]
+
+
+def test_api_rejects_unsupported_and_folder_deletes(client):
+    bad = client.post("/api/documents/upload", files={"file": ("tool.exe", b"x", "application/octet-stream")})
     assert bad.status_code == 400
+    folder_doc = next(d for d in client.get("/api/documents").json() if d["origin"] == "folder")
+    assert client.delete(f"/api/documents/{folder_doc['doc_id']}").status_code == 400
+
+
+def test_api_url_document(client, monkeypatch):
+    from app.ingest import Chunk
+    monkeypatch.setattr(knowledge, "check_public_url", lambda url: None)
+    monkeypatch.setattr(knowledge, "load_url", lambda url, audience, title, doc_id: [
+        Chunk(f"{doc_id}#1", doc_id, "Store hours", "Part 1", "Open 9 to 5.", audience, "Web page")])
+    r = client.post("/api/documents/url", json={"url": "https://example.com/hours", "audience": "public"})
+    assert r.status_code == 200
+    assert "Store hours" in [d["title"] for d in client.get("/api/documents").json()]
+
+
+def test_api_config_falls_back_without_llm(client):
+    cfg = client.get("/api/config").json()
+    assert cfg["org_name"] == config.ORG_NAME
+    assert cfg["suggestions"]["customer"] and ".pdf" in cfg["formats"]

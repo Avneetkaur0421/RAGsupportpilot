@@ -10,8 +10,10 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  ask: (question, audience) =>
-    request("/ask", { method: "POST", body: JSON.stringify({ question, audience }) }),
+  config: () => request("/config"),
+  // history = earlier [{question, answer}] so follow-up questions make sense
+  ask: (question, audience, history = []) =>
+    request("/ask", { method: "POST", body: JSON.stringify({ question, audience, history }) }),
   reviews: () => request("/reviews"),
   resolve: (id, reply, addToKb) =>
     request(`/reviews/${id}/resolve`, {
@@ -32,6 +34,10 @@ export const api = {
     if (!res.ok) throw new Error(data.detail || `Upload failed (${res.status})`);
     return data;
   },
+  addUrl: (url, title, audience) =>
+    request("/documents/url", { method: "POST", body: JSON.stringify({ url, title, audience }) }),
+  syncFolder: () => request("/documents/sync", { method: "POST" }),
+  deleteDocument: (docId) => request(`/documents/${encodeURIComponent(docId)}`, { method: "DELETE" }),
   insights: () => request("/insights"),
   suggest: () => request("/insights/suggest", { method: "POST" }),
 };
